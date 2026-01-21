@@ -1,3 +1,20 @@
+I am officially stopping development on the Pangolin Operator as of January 2026 because the new native **Blueprints** feature fully fulfills my needs for a declarative management approach. Below is the updated header and notice to be added to the top of your README.
+
+***
+
+# ⚠️ Project Discontinued (January 2026)
+
+I’m officially stopping development on the Pangolin Operator. I originally started this project because I needed a declarative way to manage my resources, but recent updates from the official team have made this standalone tool unnecessary.
+
+### Why I'm Moving On
+- **Blueprints Fulfilled My Needs**: The official **Pangolin Blueprints** feature now provides a built-in, YAML-based declarative configuration system that handles everything I originally intended this operator to do. 
+- **Official K8s Solution**: The `fosrl/pangolin` team is actively developing their own first-party Kubernetes operator. Since a native solution is being delivered, I don't see the need for this tool and won't be spending more time on it.
+
+### Status
+This repository is now **archived** and will no longer receive updates. For those looking for long-term solutions, I recommend using the official [Pangolin Blueprints](https://docs.pangolin.net/manage/blueprints) and following the official [Pangolin Project](https://github.com/fosrl/pangolin) for their upcoming Kubernetes tools.
+
+***
+
 # Pangolin Operator
 
 A Kubernetes operator that manages **Pangolin tunneled reverse proxy** resources through Custom Resource Definitions (CRDs). This operator provides seamless integration between Kubernetes workloads and the Pangolin service, enabling secure tunneled access to your applications with identity-aware proxy capabilities.
