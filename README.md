@@ -1,5 +1,3 @@
-I am officially stopping development on the Pangolin Operator as of January 2026 because the new native **Blueprints** feature fully fulfills my needs for a declarative management approach. Below is the updated header and notice to be added to the top of your README.
-
 ***
 
 # ⚠️ Project Discontinued (January 2026)
