@@ -414,7 +414,11 @@ func (in *PangolinResourceSpec) DeepCopyInto(out *PangolinResourceSpec) {
 		*out = new(ProxyConfig)
 		(*in).DeepCopyInto(*out)
 	}
-	out.Target = in.Target
+	if in.Targets != nil {
+		in, out := &in.Targets, &out.Targets
+		*out = make([]TargetConfig, len(*in))
+		copy(*out, *in)
+	}
 	if in.Enabled != nil {
 		in, out := &in.Enabled, &out.Enabled
 		*out = new(bool)

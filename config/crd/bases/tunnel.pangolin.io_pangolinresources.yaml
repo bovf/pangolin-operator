@@ -3,7 +3,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.16.1
+    controller-gen.kubebuilder.io/version: v0.17.0
   name: pangolinresources.tunnel.pangolin.io
 spec:
   group: tunnel.pangolin.io
@@ -73,6 +73,11 @@ spec:
               httpConfig:
                 description: HTTP-specific configuration
                 properties:
+                  blockAccess:
+                    description: |-
+                      BlockAccess blocks access until user is authenticated
+                      Only effective when SSO is enabled
+                    type: boolean
                   domainId:
                     description: 'OPTION 1: Domain ID to use (e.g., "domain1")'
                     type: string
@@ -81,6 +86,9 @@ spec:
                       OPTION 2: Domain name to use (e.g., "yourdomain.com") - NEW
                       If specified, will be resolved to domainId by the operator
                     type: string
+                  sso:
+                    description: SSO enables SSO authentication for this resource
+                    type: boolean
                   subdomain:
                     description: Subdomain for this resource
                     minLength: 1
@@ -126,35 +134,61 @@ spec:
                     description: SiteID is the numeric site identifier
                     type: integer
                 type: object
-              target:
-                description: Target configuration
-                properties:
-                  ip:
-                    description: Target IP or hostname
-                    type: string
-                  method:
-                    default: http
-                    description: Target method/protocol
-                    enum:
-                    - http
-                    - https
-                    - tcp
-                    - udp
-                    type: string
-                  port:
-                    description: Target port
-                    format: int32
-                    maximum: 65535
-                    minimum: 1
-                    type: integer
-                required:
-                - ip
-                - port
-                type: object
+              targets:
+                description: Targets configuration - multiple targets for path-based
+                  routing
+                items:
+                  description: TargetConfig defines the backend target
+                  properties:
+                    ip:
+                      description: Target IP or hostname
+                      type: string
+                    method:
+                      default: http
+                      description: Target method/protocol
+                      enum:
+                      - http
+                      - https
+                      - tcp
+                      - udp
+                      type: string
+                    path:
+                      description: Path to match for routing (e.g., "/api")
+                      type: string
+                    pathMatchType:
+                      description: 'PathMatchType defines how to match the path: exact,
+                        prefix, or regex'
+                      enum:
+                      - exact
+                      - prefix
+                      - regex
+                      type: string
+                    port:
+                      description: Target port
+                      format: int32
+                      maximum: 65535
+                      minimum: 1
+                      type: integer
+                    priority:
+                      default: 100
+                      description: Priority for path matching (higher = matched first)
+                      format: int32
+                      maximum: 1000
+                      minimum: 1
+                      type: integer
+                  required:
+                  - ip
+                  - port
+                  type: object
+                type: array
               tunnelRef:
                 description: Reference to the tunnel this resource belongs to
                 properties:
                   name:
+                    type: string
+                  namespace:
+                    description: Namespace of the referenced resource. If empty, defaults
+                      to the same namespace as the referencing resource.
                     type: string
                 required:
                 - name
@@ -168,6 +202,10 @@ spec:
               bindingMode:
                 description: 'Binding mode: "Created" or "Bound"'
                 type: string
+              blockAccessEnabled:
+                description: BlockAccessEnabled indicates if access is blocked until
+                  authenticated
+                type: boolean
               conditions:
                 description: Conditions represent the latest available observations
                 items:
@@ -242,6 +280,10 @@ spec:
               resourceId:
                 description: Resource ID from Pangolin API
                 type: string
+              ssoEnabled:
+                description: SSOEnabled indicates if SSO authentication is enabled
+                  for this resource
+                type: boolean
               status:
                 description: 'Current status: Creating, Ready, Error, Deleting, Waiting'
                 enum:
@@ -251,6 +293,10 @@ spec:
                 - Deleting
                 - Waiting
                 type: string
+              targetCount:
+                description: TargetCount is the number of targets configured for this
+                  resource
+                type: integer
               targetId:
                 description: 'DEPRECATED: Keep for backward compatibility but don''t
                   use'

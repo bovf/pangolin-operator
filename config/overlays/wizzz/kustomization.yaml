@@ -1,0 +1,21 @@
+# Overlay for registry.wizzz.net/stefb/
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+- ../../default
+
+images:
+- name: controller
+  newName: registry.wizzz.net/stefb/pangolin-operator
+  newTag: latest
+
+patches:
+- target:
+    kind: Deployment
+    name: controller-manager
+  patch: |-
+    - op: add
+      path: /spec/template/spec/imagePullSecrets
+      value:
+        - name: docker-wz-registry

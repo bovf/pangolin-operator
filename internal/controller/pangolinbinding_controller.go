@@ -271,10 +271,12 @@ func (r *PangolinBindingReconciler) reconcileResourceForBinding(ctx context.Cont
 				},
 				Name:     fmt.Sprintf("%s-%s", binding.Spec.ServiceRef.Name, binding.Spec.Protocol),
 				Protocol: binding.Spec.Protocol,
-				Target: tunnelv1alpha1.TargetConfig{
-					IP:     service.Spec.ClusterIP,
-					Port:   binding.Spec.ServicePort,
-					Method: "http", // TODO: Derive from protocol (http/https/tcp)
+				Targets: []tunnelv1alpha1.TargetConfig{
+					{
+						IP:     service.Spec.ClusterIP,
+						Port:   binding.Spec.ServicePort,
+						Method: "http", // TODO: Derive from protocol (http/https/tcp)
+					},
 				},
 			},
 		}

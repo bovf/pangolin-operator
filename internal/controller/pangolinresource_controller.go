@@ -12,6 +12,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -26,7 +27,8 @@ const ResourceFinalizerName = "resource.pangolin.io/finalizer"
 // PangolinResourceReconciler reconciles a PangolinResource object
 type PangolinResourceReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme   *runtime.Scheme
+	Recorder record.EventRecorder
 }
 
 //+kubebuilder:rbac:groups=tunnel.pangolin.io,resources=pangolinresources,verbs=get;list;watch;create;update;patch;delete
@@ -35,6 +37,7 @@ type PangolinResourceReconciler struct {
 //+kubebuilder:rbac:groups=tunnel.pangolin.io,resources=pangolintunnels,verbs=get;list;watch
 //+kubebuilder:rbac:groups=tunnel.pangolin.io,resources=pangolinorganizations,verbs=get;list;watch
 //+kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
+//+kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 // Reconcile implements the reconciliation logic for PangolinResource.
 //
@@ -169,8 +172,8 @@ func (r *PangolinResourceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 
 	// Reconcile targets if target is specified in spec
 	// This ensures the target from spec exists and tracks all targets
-	if resource.Spec.Target.IP != "" {
-		logger.Info("Reconciling targets for resource", "resourceID", resourceID)
+	if len(resource.Spec.Targets) > 0 {
+		logger.Info("Reconciling targets for resource", "resourceID", resourceID, "targetCount", len(resource.Spec.Targets))
 
 		allTargetIDs, err := r.reconcilePangolinTarget(ctx, apiClient, resourceID, resource, siteID)
 		if err != nil {
@@ -178,16 +181,25 @@ func (r *PangolinResourceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 			return r.updateResourceStatus(ctx, resource, "Error", err.Error())
 		}
 
-		resource.Status.TargetIDs = allTargetIDs
 		logger.Info("Targets reconciled", "totalTargets", len(allTargetIDs), "targetIDs", allTargetIDs)
+
+		// Re-fetch resource to avoid optimistic locking conflict
+		if err := r.Get(ctx, req.NamespacedName, resource); err != nil {
+			logger.Error(err, "Failed to re-fetch resource before status update")
+			return ctrl.Result{}, err
+		}
+
+		resource.Status.TargetIDs = allTargetIDs
+		resource.Status.TargetCount = len(allTargetIDs)
 
 		// Update status immediately after target reconciliation to prevent duplicate creates
 		if err := r.Status().Update(ctx, resource); err != nil {
 			logger.Error(err, "Failed to update status after target reconciliation")
-			return ctrl.Result{}, err
+			// Requeue to retry - this is a transient conflict
+			return ctrl.Result{Requeue: true}, nil
 		}
 	} else {
-		logger.Info("No target specified, resource has no operator-managed targets", "resourceID", resourceID)
+		logger.Info("No targets specified, resource has no operator-managed targets", "resourceID", resourceID)
 
 		// Still track any existing targets (manually added via UI)
 		existingTargets, err := apiClient.ListTargets(ctx, resourceID)
@@ -217,8 +229,13 @@ func (r *PangolinResourceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 // The tunnel provides the site context (site ID) for target creation.
 func (r *PangolinResourceReconciler) getTunnelForResource(ctx context.Context, resource *tunnelv1alpha1.PangolinResource) (*tunnelv1alpha1.PangolinTunnel, error) {
 	tunnel := &tunnelv1alpha1.PangolinTunnel{}
+	// Use tunnel namespace from ref, fallback to resource namespace
+	tunnelNamespace := resource.Spec.TunnelRef.Namespace
+	if tunnelNamespace == "" {
+		tunnelNamespace = resource.Namespace
+	}
 	if err := r.Get(ctx, types.NamespacedName{
-		Namespace: resource.Namespace,
+		Namespace: tunnelNamespace,
 		Name:      resource.Spec.TunnelRef.Name,
 	}, tunnel); err != nil {
 		return nil, fmt.Errorf("failed to get tunnel %s: %w", resource.Spec.TunnelRef.Name, err)
@@ -298,11 +315,13 @@ func (r *PangolinResourceReconciler) reconcilePangolinResource(
 		resource.Status.FullDomain = fullDomain
 
 		resSpec = pangolin.ResourceCreateSpec{
-			Name:      resource.Spec.Name,
-			HTTP:      true,
-			Protocol:  "tcp",
-			Subdomain: resource.Spec.HTTPConfig.Subdomain,
-			DomainID:  domainID,
+			Name:        resource.Spec.Name,
+			HTTP:        true,
+			Protocol:    "tcp",
+			Subdomain:   resource.Spec.HTTPConfig.Subdomain,
+			DomainID:    domainID,
+			SSO:         resource.Spec.HTTPConfig.SSO,
+			BlockAccess: resource.Spec.HTTPConfig.BlockAccess,
 		}
 	} else if resource.Spec.ProxyConfig != nil {
 		// TCP/UDP resource with proxy configuration
@@ -322,10 +341,57 @@ func (r *PangolinResourceReconciler) reconcilePangolinResource(
 	// Create resource via Pangolin API
 	pRes, err := api.CreateResource(ctx, orgID, siteID, resSpec)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create Pangolin resource: %w", err)
+		// Handle 409 Conflict - resource already exists
+		if strings.Contains(err.Error(), "409") || strings.Contains(err.Error(), "already exists") {
+			logger.Info("Resource already exists in Pangolin, attempting to find and bind")
+
+			var existingRes *pangolin.Resource
+			var findErr error
+
+			// Try to find existing resource by subdomain + domainID first
+			if resource.Spec.HTTPConfig != nil {
+				existingRes, findErr = api.FindResourceBySubdomain(ctx, orgID,
+					resource.Spec.HTTPConfig.Subdomain,
+					resource.Status.ResolvedDomainID)
+				if findErr != nil {
+					logger.Error(findErr, "Failed to find existing resource by subdomain")
+				}
+			}
+
+			// Fallback: find by resource name (unique per host)
+			if existingRes == nil && resource.Spec.Name != "" {
+				existingRes, findErr = api.FindResourceByName(ctx, orgID, resource.Spec.Name)
+				if findErr != nil {
+					logger.Error(findErr, "Failed to find existing resource by name")
+				}
+			}
+
+			if existingRes != nil {
+				logger.Info("Found existing resource, binding to it",
+					"resourceID", existingRes.EffectiveID(),
+					"name", existingRes.Name,
+					"subdomain", existingRes.Subdomain)
+				resource.Status.BindingMode = "Bound"
+				pRes = existingRes
+			} else {
+				return nil, fmt.Errorf("resource exists but could not be found (subdomain=%s, domainID=%s, name=%s): %w",
+					resource.Spec.HTTPConfig.Subdomain, resource.Status.ResolvedDomainID, resource.Spec.Name, err)
+			}
+		} else {
+			return nil, fmt.Errorf("failed to create Pangolin resource: %w", err)
+		}
+	} else {
+		resource.Status.BindingMode = "Created"
 	}
 
-	resource.Status.BindingMode = "Created"
+	// Update SSO settings (for both new and existing resources)
+	if resource.Spec.Protocol == "http" && resource.Spec.HTTPConfig != nil {
+		if err := r.updateResourceSSO(ctx, api, pRes.EffectiveID(), resource); err != nil {
+			logger.Error(err, "Failed to update SSO settings, resource created/bound but SSO not configured")
+			// Don't fail the whole operation, resource is created/bound
+		}
+	}
+
 	return pRes, nil
 }
 
@@ -395,56 +461,101 @@ func (r *PangolinResourceReconciler) reconcilePangolinTarget(
 
 	logger.Info("Found existing targets", "count", len(existingTargets))
 
-	// Check if target matching spec already exists
-	desiredTarget := resource.Spec.Target
-	targetExists := false
+	// Get desired targets from spec
+	desiredTargets := resource.Spec.Targets
+	if len(desiredTargets) == 0 {
+		logger.Info("No targets specified in resource spec")
+		return []string{}, nil
+	}
 
-	for _, t := range existingTargets {
-		if r.targetMatchesSpec(t, desiredTarget, siteID) {
-			logger.Info("Target matching spec already exists",
-				"targetID", t.EffectiveID(),
-				"ip", t.IP,
-				"port", t.Port,
-				"method", t.Method)
-			targetExists = true
-			break
+	// Create targets that don't exist
+	for _, desiredTarget := range desiredTargets {
+		targetExists := false
+
+		for _, t := range existingTargets {
+			if r.targetMatchesSpec(t, desiredTarget, siteID) {
+				logger.Info("Target matching spec already exists",
+					"targetID", t.EffectiveID(),
+					"ip", t.IP,
+					"port", t.Port,
+					"path", desiredTarget.Path)
+				targetExists = true
+				break
+			}
+		}
+
+		if !targetExists {
+			logger.Info("Target matching spec not found, creating new target",
+				"ip", desiredTarget.IP,
+				"port", desiredTarget.Port,
+				"path", desiredTarget.Path)
+
+			tSpec := pangolin.TargetCreateSpec{
+				IP:            desiredTarget.IP,
+				Port:          desiredTarget.Port,
+				Method:        desiredTarget.Method,
+				Enabled:       true,
+				Path:          desiredTarget.Path,
+				PathMatchType: desiredTarget.PathMatchType,
+				Priority:      desiredTarget.Priority,
+			}
+
+			// Respect explicit enabled=false in spec
+			if resource.Spec.Enabled != nil && !*resource.Spec.Enabled {
+				tSpec.Enabled = false
+			}
+
+			logger.Info("Creating target", "siteID", siteID, "spec", tSpec)
+
+			_, err := api.CreateTarget(ctx, resourceID, siteID, tSpec)
+			if err != nil {
+				// Handle "already exists" error gracefully (race condition)
+				if !strings.Contains(err.Error(), "already exists") {
+					logger.Error(err, "Failed to create Pangolin target", "path", desiredTarget.Path)
+					continue // Try other targets
+				}
+				logger.Info("Target creation reported 'already exists', considering as success")
+			} else {
+				logger.Info("Target created successfully", "path", desiredTarget.Path)
+			}
 		}
 	}
 
-	// Create target if it doesn't exist
-	if !targetExists {
-		logger.Info("Target matching spec not found, creating new target")
+	// Re-fetch targets to get complete list
+	existingTargets, err = api.ListTargets(ctx, resourceID)
+	if err != nil {
+		logger.Error(err, "Failed to re-fetch targets after creation")
+	}
 
-		tSpec := pangolin.TargetCreateSpec{
-			IP:      desiredTarget.IP,
-			Port:    desiredTarget.Port,
-			Method:  desiredTarget.Method,
-			Enabled: true,
-		}
-
-		// Respect explicit enabled=false in spec
-		if resource.Spec.Enabled != nil && !*resource.Spec.Enabled {
-			tSpec.Enabled = false
-		}
-
-		logger.Info("Creating target", "siteID", siteID, "spec", tSpec)
-
-		_, err := api.CreateTarget(ctx, resourceID, siteID, tSpec)
-		if err != nil {
-			// Handle "already exists" error gracefully (race condition)
-			if !strings.Contains(err.Error(), "already exists") {
-				return nil, fmt.Errorf("failed to create Pangolin target: %w", err)
+	// Delete orphaned targets (exist in Pangolin but not in spec)
+	for _, existingTarget := range existingTargets {
+		isOrphan := true
+		for _, desiredTarget := range desiredTargets {
+			if r.targetMatchesSpec(existingTarget, desiredTarget, siteID) {
+				isOrphan = false
+				break
 			}
-			logger.Info("Target creation reported 'already exists', considering as success")
-		} else {
-			logger.Info("Target created successfully")
 		}
 
-		// Re-fetch targets to get complete list including newly created target
-		existingTargets, err = api.ListTargets(ctx, resourceID)
-		if err != nil {
-			logger.Error(err, "Failed to re-fetch targets after creation")
+		if isOrphan {
+			targetID := existingTarget.EffectiveID()
+			if targetID != "" {
+				logger.Info("Deleting orphaned target",
+					"targetID", targetID,
+					"ip", existingTarget.IP,
+					"port", existingTarget.Port)
+				if err := api.DeleteTarget(ctx, resourceID, targetID); err != nil {
+					logger.Error(err, "Failed to delete orphaned target", "targetID", targetID)
+					// Continue with other deletions
+				}
+			}
 		}
+	}
+
+	// Re-fetch targets one more time after deletions
+	existingTargets, err = api.ListTargets(ctx, resourceID)
+	if err != nil {
+		logger.Error(err, "Failed to re-fetch targets after deletion")
 	}
 
 	// Build complete list of target IDs
@@ -504,24 +615,51 @@ func (r *PangolinResourceReconciler) resolveDomainForResource(
 	if resource.Spec.HTTPConfig != nil && resource.Spec.HTTPConfig.DomainID != "" {
 		domainID := resource.Spec.HTTPConfig.DomainID
 		subdomain := resource.Spec.HTTPConfig.Subdomain
-		fullDomain := fmt.Sprintf("%s.dobryops.com", subdomain)
-		return domainID, fullDomain, nil
+
+		// Find domain name by ID to construct full domain
+		for _, domain := range org.Status.Domains {
+			if domain.DomainID == domainID {
+				fullDomain := fmt.Sprintf("%s.%s", subdomain, domain.BaseDomain)
+				return domainID, fullDomain, nil
+			}
+		}
+
+		// Domain ID not found - return error
+		return "", "", fmt.Errorf("domain ID %q not found in organization %s", domainID, org.Name)
 	}
 
 	// Priority 2: Domain name (resolve to ID)
 	if resource.Spec.HTTPConfig != nil && resource.Spec.HTTPConfig.DomainName != "" {
-		domainID := "domain1"
+		domainName := resource.Spec.HTTPConfig.DomainName
 		subdomain := resource.Spec.HTTPConfig.Subdomain
-		fullDomain := fmt.Sprintf("%s.%s", subdomain, resource.Spec.HTTPConfig.DomainName)
-		return domainID, fullDomain, nil
+		fullDomain := fmt.Sprintf("%s.%s", subdomain, domainName)
+
+		// Find domain ID by matching domain name in org.Status.Domains
+		for _, domain := range org.Status.Domains {
+			if domain.BaseDomain == domainName {
+				return domain.DomainID, fullDomain, nil
+			}
+		}
+
+		// Domain not found in organization - return error
+		return "", "", fmt.Errorf("domain %q not found in organization %s", domainName, org.Name)
 	}
 
 	// Priority 3: Organization default domain
 	if org.Status.DefaultDomainID != "" {
 		domainID := org.Status.DefaultDomainID
 		subdomain := resource.Spec.HTTPConfig.Subdomain
-		fullDomain := fmt.Sprintf("%s.dobryops.com", subdomain)
-		return domainID, fullDomain, nil
+
+		// Find default domain name by ID
+		for _, domain := range org.Status.Domains {
+			if domain.DomainID == domainID {
+				fullDomain := fmt.Sprintf("%s.%s", subdomain, domain.BaseDomain)
+				return domainID, fullDomain, nil
+			}
+		}
+
+		// Default domain ID set but not found in domains list
+		return "", "", fmt.Errorf("default domain ID %q not found in organization %s", domainID, org.Name)
 	}
 
 	return "", "", fmt.Errorf("could not resolve domain for resource")
@@ -582,6 +720,69 @@ func (r *PangolinResourceReconciler) updateResourceStatus(ctx context.Context, r
 		return ctrl.Result{RequeueAfter: time.Minute}, err
 	}
 	return ctrl.Result{}, err
+}
+
+// updateResourceSSO updates the SSO and BlockAccess settings for a resource.
+// This must be called after resource creation because the Pangolin API
+// does not accept SSO fields during resource creation.
+//
+// Parameters:
+//   - ctx: Context for request cancellation
+//   - api: Pangolin API client
+//   - resourceID: The Pangolin resource ID to update
+//   - resource: The PangolinResource CR containing the desired SSO settings
+//
+// Returns error if the update fails.
+func (r *PangolinResourceReconciler) updateResourceSSO(
+	ctx context.Context,
+	api *pangolin.Client,
+	resourceID string,
+	resource *tunnelv1alpha1.PangolinResource,
+) error {
+	logger := log.FromContext(ctx)
+
+	if resource.Spec.HTTPConfig == nil {
+		return nil
+	}
+
+	sso := resource.Spec.HTTPConfig.SSO
+	blockAccess := resource.Spec.HTTPConfig.BlockAccess
+
+	logger.Info("Updating SSO settings for resource",
+		"resourceID", resourceID,
+		"sso", sso,
+		"blockAccess", blockAccess,
+	)
+
+	updateSpec := pangolin.ResourceUpdateSpec{
+		SSO:         &sso,
+		BlockAccess: &blockAccess,
+	}
+
+	_, err := api.UpdateResource(ctx, resourceID, updateSpec)
+	if err != nil {
+		return fmt.Errorf("failed to update resource SSO settings: %w", err)
+	}
+
+	// Update status to reflect SSO configuration
+	resource.Status.SSOEnabled = sso
+	resource.Status.BlockAccessEnabled = blockAccess
+
+	logger.Info("Successfully updated SSO settings",
+		"resourceID", resourceID,
+		"sso", sso,
+		"blockAccess", blockAccess,
+	)
+
+	// Emit Kubernetes event for SSO configuration
+	if r.Recorder != nil {
+		eventType := corev1.EventTypeNormal
+		reason := "SSOConfigured"
+		message := fmt.Sprintf("SSO configured: sso=%v, blockAccess=%v", sso, blockAccess)
+		r.Recorder.Event(resource, eventType, reason, message)
+	}
+
+	return nil
 }
 
 // handleResourceDeletion handles the cleanup when a PangolinResource is deleted.

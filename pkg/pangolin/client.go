@@ -329,6 +329,95 @@ func (c *Client) CreateSite(ctx context.Context, orgID, name, siteType string) (
 	return &result.Data, nil
 }
 
+// ListResources retrieves all resources for an organization.
+//
+// Parameters:
+//   - ctx: Context for request cancellation
+//   - orgID: Organization ID to query resources for
+//
+// Returns:
+//   - Slice of Resource objects
+//   - Error if request fails
+func (c *Client) ListResources(ctx context.Context, orgID string) ([]Resource, error) {
+	path := fmt.Sprintf("/org/%s/resources?limit=1000&offset=0", orgID)
+	resp, err := c.makeRequest(ctx, "GET", path, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return nil, fmt.Errorf("list resources failed: status %d: %s", resp.StatusCode, string(b))
+	}
+
+	var result struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Resources []Resource `json:"resources"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+	if !result.Success {
+		return nil, fmt.Errorf("API request was not successful")
+	}
+	return result.Data.Resources, nil
+}
+
+// FindResourceBySubdomain finds a resource by its subdomain and domain ID.
+//
+// Parameters:
+//   - ctx: Context for request cancellation
+//   - orgID: Organization ID to search in
+//   - subdomain: Subdomain to match
+//   - domainID: Domain ID to match (required for accurate matching)
+//
+// Returns:
+//   - Resource if found, nil if not found
+//   - Error if request fails
+func (c *Client) FindResourceBySubdomain(ctx context.Context, orgID, subdomain, domainID string) (*Resource, error) {
+	resources, err := c.ListResources(ctx, orgID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Match by subdomain AND domainID (both required for multi-domain support)
+	for _, r := range resources {
+		if r.Subdomain == subdomain && r.DomainID == domainID {
+			return &r, nil
+		}
+	}
+
+	return nil, nil // Not found
+}
+
+// FindResourceByName finds a resource by its display name.
+//
+// Parameters:
+//   - ctx: Context for request cancellation
+//   - orgID: Organization ID to search in
+//   - name: Resource name to match (e.g., "namespace/ingress/host")
+//
+// Returns:
+//   - Resource if found, nil if not found
+//   - Error if request fails
+func (c *Client) FindResourceByName(ctx context.Context, orgID, name string) (*Resource, error) {
+	resources, err := c.ListResources(ctx, orgID)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, r := range resources {
+		if r.Name == name {
+			return &r, nil
+		}
+	}
+
+	return nil, nil // Not found
+}
+
 // CreateResource creates a new resource at the organization level.
 //
 // Resources represent services to be exposed through Pangolin. They are created at the
@@ -518,6 +607,30 @@ func (c *Client) CreateTarget(ctx context.Context, resourceID, siteID string, sp
 	return &result.Data, nil
 }
 
+// DeleteTarget deletes a target from a resource.
+//
+// Parameters:
+//   - ctx: Context for request cancellation
+//   - resourceID: Resource ID that owns the target
+//   - targetID: Target ID to delete
+//
+// Returns error if deletion fails.
+func (c *Client) DeleteTarget(ctx context.Context, resourceID, targetID string) error {
+	path := fmt.Sprintf("resource/%s/target/%s", resourceID, targetID)
+	resp, err := c.makeRequest(ctx, "DELETE", path, nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return fmt.Errorf("delete target failed: status %d: %s", resp.StatusCode, string(b))
+	}
+
+	return nil
+}
+
 // ListTargets retrieves all targets (backends) for a specific resource.
 //
 // Used for:
@@ -577,6 +690,84 @@ func (c *Client) ListTargets(ctx context.Context, resourceID string) ([]Target, 
 	}
 
 	return result.Data.Targets, nil
+}
+
+// UpdateResource updates an existing resource's configuration.
+//
+// This method is used to update resource settings that cannot be set during creation,
+// such as SSO authentication settings.
+//
+// Parameters:
+//   - ctx: Context for request cancellation
+//   - resourceID: Resource ID to update
+//   - spec: Update specification with fields to modify
+//
+// Returns:
+//   - Updated Resource object
+//   - Error if update fails or resource not found
+//
+// Updatable Fields:
+//   - SSO: Enable/disable SSO authentication
+//   - BlockAccess: Block access until authenticated (requires SSO enabled)
+//   - Name, Subdomain, Enabled, etc.
+func (c *Client) UpdateResource(ctx context.Context, resourceID string, spec ResourceUpdateSpec) (*Resource, error) {
+	data := make(map[string]interface{})
+
+	// Only include fields that are explicitly set
+	if spec.SSO != nil {
+		data["sso"] = *spec.SSO
+	}
+	if spec.BlockAccess != nil {
+		data["blockAccess"] = *spec.BlockAccess
+	}
+	if spec.Enabled != nil {
+		data["enabled"] = *spec.Enabled
+	}
+
+	if len(data) == 0 {
+		return nil, fmt.Errorf("no fields to update")
+	}
+
+	path := fmt.Sprintf("/resource/%s", resourceID)
+	resp, err := c.makeRequest(ctx, "POST", path, data)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	ct := resp.Header.Get("Content-Type")
+	if !strings.HasPrefix(ct, "application/json") {
+		return nil, fmt.Errorf("unexpected content-type %q status %d: %s", ct, resp.StatusCode, string(bodyBytes))
+	}
+
+	var result struct {
+		Success bool        `json:"success"`
+		Data    Resource    `json:"data"`
+		Error   interface{} `json:"error,omitempty"`
+		Message string      `json:"message,omitempty"`
+		Status  int         `json:"status,omitempty"`
+	}
+	if err := json.Unmarshal(bodyBytes, &result); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w, body: %s", err, string(bodyBytes))
+	}
+
+	if !result.Success {
+		errMsg := "API request was not successful"
+		if result.Message != "" {
+			errMsg = fmt.Sprintf("%s: %s", errMsg, result.Message)
+		}
+		if result.Status > 0 {
+			errMsg = fmt.Errorf("%s (status: %d)", errMsg, result.Status).Error()
+		}
+		return nil, fmt.Errorf(errMsg)
+	}
+
+	return &result.Data, nil
 }
 
 // mustParseInt converts a string to an integer, returning 0 on error.
